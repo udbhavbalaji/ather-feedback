@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import json
 from typing import Optional
 
 TURSO_URL = os.getenv("TURSO_URL")
@@ -7,14 +8,58 @@ TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "ather.db")
 
+USE_TURSO = bool(TURSO_URL and TURSO_AUTH_TOKEN)
+
+
+def turso_execute(sql: str, args: list = None):
+    import requests
+
+    turso_url = TURSO_URL.replace("libsql://", "https://")
+    response = requests.post(
+        turso_url,
+        headers={
+            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"statements": [sql]},
+    )
+    if response.status_code != 200:
+        raise Exception(f"Turso error: {response.status_code} - {response.text}")
+    result = response.json()
+    if isinstance(result, list) and len(result) > 0:
+        return result[0]
+    return result
+
+
+def turso_execute_batch(sql: str, args_list: list = None):
+    import requests
+
+    statements = [{"sql": sql, "args": args} for args in (args_list or [[]])]
+    response = requests.post(
+        f"{TURSO_URL}",
+        headers={
+            "Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"statements": statements},
+    )
+    if response.status_code != 200:
+        raise Exception(f"Turso error: {response.status_code} - {response.text}")
+    return response.json()
+
 
 def get_connection():
+    if USE_TURSO:
+        return None
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
+    if USE_TURSO:
+        return
+
     import subprocess
 
     schema_path = os.path.join(os.path.dirname(__file__), "..", "libsql", "schema.sql")
@@ -34,8 +79,6 @@ def init_db():
 
 
 def insert_post(post_data: dict) -> bool:
-    conn = get_connection()
-
     sql = """
     INSERT OR IGNORE INTO posts (
       id, reddit_id, subreddit, title, body, author, url,
@@ -44,51 +87,52 @@ def insert_post(post_data: dict) -> bool:
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
+    args = [
+        post_data["id"],
+        post_data["reddit_id"],
+        post_data["subreddit"],
+        post_data["title"],
+        post_data.get("body"),
+        post_data.get("author"),
+        post_data.get("url"),
+        post_data.get("score", 0),
+        post_data.get("num_comments", 0),
+        post_data["created_at"],
+        1 if post_data.get("is_owner_verified", False) else 0,
+        post_data.get("sentiment_polarity"),
+        post_data.get("sentiment_label"),
+    ]
+
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            sql,
-            [
-                post_data["id"],
-                post_data["reddit_id"],
-                post_data["subreddit"],
-                post_data["title"],
-                post_data.get("body"),
-                post_data.get("author"),
-                post_data.get("url"),
-                post_data.get("score", 0),
-                post_data.get("num_comments", 0),
-                post_data["created_at"],
-                post_data.get("is_owner_verified", False),
-                post_data.get("sentiment_polarity"),
-                post_data.get("sentiment_label"),
-            ],
-        )
-        conn.commit()
-        conn.close()
+        if USE_TURSO:
+            turso_execute(sql, args)
+        else:
+            conn = get_connection()
+            conn.execute(sql, args)
+            conn.commit()
+            conn.close()
         return True
     except Exception as e:
         print(f"Error inserting post: {e}")
-        conn.close()
         return False
 
 
 def insert_tag(post_id: str, tag: str, source: str = "keyword"):
-    conn = get_connection()
-
     sql = """
     INSERT OR IGNORE INTO post_tags (post_id, tag, source)
     VALUES (?, ?, ?)
     """
 
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, [post_id, tag, source])
-        conn.commit()
-        conn.close()
+        if USE_TURSO:
+            turso_execute(sql, [post_id, tag, source])
+        else:
+            conn = get_connection()
+            conn.execute(sql, [post_id, tag, source])
+            conn.commit()
+            conn.close()
     except Exception as e:
         print(f"Error inserting tag: {e}")
-        conn.close()
 
 
 def get_posts(
@@ -99,8 +143,6 @@ def get_posts(
     verified_only: bool = False,
     subreddit: Optional[str] = None,
 ):
-    conn = get_connection()
-
     conditions = ["1=1"]
     params = []
 
@@ -141,55 +183,93 @@ def get_posts(
         """
         params.extend([limit, offset])
 
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return rows
+    if USE_TURSO:
+        result = turso_execute(sql, params)
+        rows = []
+        results_data = result.get("results", {})
+        cols = results_data.get("columns", [])
+        for row in results_data.get("rows", []):
+            rows.append({k: v for k, v in zip(cols, row)})
+        return rows
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
 
 
 def get_stats():
-    conn = get_connection()
-    cursor = conn.cursor()
+    if USE_TURSO:
+        result = turso_execute(
+            """SELECT 
+              COUNT(*) as total_posts,
+              COUNT(CASE WHEN is_owner_verified = 1 THEN 1 END) as owner_posts,
+              AVG(sentiment_polarity) as avg_sentiment,
+              COUNT(CASE WHEN sentiment_polarity > 0.05 THEN 1 END) as positive_count,
+              COUNT(CASE WHEN sentiment_polarity < -0.05 THEN 1 END) as negative_count,
+              COUNT(CASE WHEN sentiment_label = 'neutral' THEN 1 END) as neutral_count
+            FROM posts"""
+        )
+        results_data = result.get("results", {})
+        r = results_data.get("rows", [[]])[0]
+        cols = results_data.get("columns", [])
+        row = {k: v for k, v in zip(cols, r)}
 
-    stats_sql = """
-    SELECT 
-      COUNT(*) as total_posts,
-      COUNT(CASE WHEN is_owner_verified = 1 THEN 1 END) as owner_posts,
-      AVG(sentiment_polarity) as avg_sentiment,
-      COUNT(CASE WHEN sentiment_polarity > 0.05 THEN 1 END) as positive_count,
-      COUNT(CASE WHEN sentiment_polarity < -0.05 THEN 1 END) as negative_count,
-      COUNT(CASE WHEN sentiment_label = 'neutral' THEN 1 END) as neutral_count
-    FROM posts
-    """
+        week_result = turso_execute(
+            "SELECT COUNT(*) as weekly_posts FROM posts WHERE created_at > strftime('%s', 'now', '-7 days')"
+        )
+        week_row = week_result.get("results", {}).get("rows", [[0]])[0][0]
 
-    cursor.execute(stats_sql)
-    row = cursor.fetchone()
+        return {
+            "total_posts": row.get("total_posts", 0) or 0,
+            "owner_posts": row.get("owner_posts", 0) or 0,
+            "avg_sentiment": row.get("avg_sentiment", 0) or 0,
+            "positive_count": row.get("positive_count", 0) or 0,
+            "negative_count": row.get("negative_count", 0) or 0,
+            "neutral_count": row.get("neutral_count", 0) or 0,
+            "weekly_posts": week_row or 0,
+        }
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    week_sql = """
-    SELECT COUNT(*) as weekly_posts FROM posts
-    WHERE created_at > strftime('%s', 'now', '-7 days')
-    """
-    cursor.execute(week_sql)
-    week_row = cursor.fetchone()
+        stats_sql = """
+        SELECT 
+          COUNT(*) as total_posts,
+          COUNT(CASE WHEN is_owner_verified = 1 THEN 1 END) as owner_posts,
+          AVG(sentiment_polarity) as avg_sentiment,
+          COUNT(CASE WHEN sentiment_polarity > 0.05 THEN 1 END) as positive_count,
+          COUNT(CASE WHEN sentiment_polarity < -0.05 THEN 1 END) as negative_count,
+          COUNT(CASE WHEN sentiment_label = 'neutral' THEN 1 END) as neutral_count
+        FROM posts
+        """
 
-    conn.close()
+        cursor.execute(stats_sql)
+        row = cursor.fetchone()
 
-    return {
-        "total_posts": row["total_posts"] if row else 0,
-        "owner_posts": row["owner_posts"] if row else 0,
-        "avg_sentiment": row["avg_sentiment"] if row else 0,
-        "positive_count": row["positive_count"] if row else 0,
-        "negative_count": row["negative_count"] if row else 0,
-        "neutral_count": row["neutral_count"] if row else 0,
-        "weekly_posts": week_row["weekly_posts"] if week_row else 0,
-    }
+        week_sql = """
+        SELECT COUNT(*) as weekly_posts FROM posts
+        WHERE created_at > strftime('%s', 'now', '-7 days')
+        """
+        cursor.execute(week_sql)
+        week_row = cursor.fetchone()
+
+        conn.close()
+
+        return {
+            "total_posts": row["total_posts"] if row else 0,
+            "owner_posts": row["owner_posts"] if row else 0,
+            "avg_sentiment": row["avg_sentiment"] if row else 0,
+            "positive_count": row["positive_count"] if row else 0,
+            "negative_count": row["negative_count"] if row else 0,
+            "neutral_count": row["neutral_count"] if row else 0,
+            "weekly_posts": week_row["weekly_posts"] if week_row else 0,
+        }
 
 
 def get_clusters():
-    conn = get_connection()
-    cursor = conn.cursor()
-
     sql = """
     SELECT 
       c.id, c.name, c.keywords, c.color, c.icon,
@@ -200,16 +280,24 @@ def get_clusters():
     ORDER BY post_count DESC
     """
 
-    cursor.execute(sql)
-    rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return rows
+    if USE_TURSO:
+        result = turso_execute(sql)
+        results_data = result.get("results", {})
+        cols = results_data.get("columns", [])
+        rows = []
+        for row in results_data.get("rows", []):
+            rows.append({k: v for k, v in zip(cols, row)})
+        return rows
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
 
 
 def get_sentiment_trend(days: int = 30):
-    conn = get_connection()
-    cursor = conn.cursor()
-
     sql = """
     SELECT 
       date(created_at, 'unixepoch') as date,
@@ -221,23 +309,74 @@ def get_sentiment_trend(days: int = 30):
     ORDER BY date ASC
     """
 
-    cursor.execute(sql, [str(days)])
-    rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return rows
+    if USE_TURSO:
+        result = turso_execute(sql, [str(days)])
+        results_data = result.get("results", {})
+        cols = results_data.get("columns", [])
+        rows = []
+        for row in results_data.get("rows", []):
+            rows.append({k: v for k, v in zip(cols, row)})
+        return rows
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+
+
+def get_sentiment_trend(days: int = 30):
+    sql = """
+    SELECT 
+      date(created_at, 'unixepoch') as date,
+      AVG(sentiment_polarity) as avg_sentiment,
+      COUNT(*) as post_count
+    FROM posts
+    WHERE created_at > strftime('%s', 'now', '-' || ? || ' days')
+    GROUP BY date(created_at, 'unixepoch')
+    ORDER BY date ASC
+    """
+
+    if USE_TURSO:
+        result = turso_execute(sql, [str(days)])
+        rows = []
+        if result.get("results"):
+            for row in result["results"][0].get("rows", []):
+                rows.append(
+                    {k: v for k, v in zip(result["results"][0]["columns"], row)}
+                )
+        return rows
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, [str(days)])
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
 
 
 def post_exists(reddit_id: str) -> bool:
-    conn = get_connection()
-    cursor = conn.cursor()
-
     sql = "SELECT 1 FROM posts WHERE reddit_id = ? LIMIT 1"
-    cursor.execute(sql, [reddit_id])
-    exists = cursor.fetchone() is not None
-    conn.close()
-    return exists
+
+    if USE_TURSO:
+        result = turso_execute(sql, [reddit_id])
+        rows = result.get("results", {}).get("rows", [])
+        return len(rows) > 0
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(sql, [reddit_id])
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
 
 
 def sync():
-    print("Note: For local development, data is stored in ather.db")
-    print("To sync to Turso, run: turso db push ather-feedback-udbhavbalaji ather.db")
+    if USE_TURSO:
+        print("Data will be written directly to Turso")
+    else:
+        print("Note: For local development, data is stored in ather.db")
+        print(
+            "To sync to Turso, run: turso db push ather-feedback-udbhavbalaji ather.db"
+        )

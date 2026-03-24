@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.11'
       
-      - run: pip install requests nltk libsql-client python-dotenv
+      - run: pip install -r backend/requirements.txt
       - run: python -m nltk.downloader vader_lexicon --quiet
       
       - run: python backend/main.py
